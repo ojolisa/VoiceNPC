@@ -1,6 +1,10 @@
 google-genai
+livekit-agents
+livekit-plugins-cartesia
+livekit-plugins-google
+cartesia
 sounddevice
 soundfile
-edge-tts
 python-dotenv
 numpy
+edge-tts

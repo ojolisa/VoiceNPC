@@ -3,49 +3,40 @@ import json
 import threading
 import time
 from audio_recorder import AudioRecorder
-from ai_agent import GeminiAgent
-from tts_manager import TTSManager
+from livekit_agent import LiveKitVoiceNPCAgent
 
 HOST = "127.0.0.1"
 PORT = 8765
 
 recorder = AudioRecorder()
-agent = GeminiAgent()
-tts = TTSManager()
+agent = LiveKitVoiceNPCAgent()
 
 current_context = {}
 is_recording = False
 lock = threading.Lock()
 
 def process_interaction(client_sock, context: dict, audio_bytes: bytes):
-    """Processes Arthur's voice with Gemini, triggers TTS, and sends back subtitles."""
-    is_male = context.get("isMale", True)
+    """Processes Arthur's voice with LiveKit Voice Agent (Gemini + Cartesia) and sends subtitles to RDR2."""
     mode = context.get("mode", "greet")
-    print(f"\n[AI] Processing conversation... (Mode: {mode}, Audio size: {len(audio_bytes)} bytes)")
+    print(f"\n[AI] Processing conversation via LiveKit Agent... (Mode: {mode}, Audio size: {len(audio_bytes)} bytes)")
 
     t0 = time.time()
-    result = agent.generate_npc_reply(context, audio_bytes)
+    result = agent.process_turn(context, audio_bytes=audio_bytes)
     t1 = time.time()
 
     transcription = result.get("transcription", "")
     speaker = result.get("speaker", "Stranger")
     text = result.get("text", "...")
-    print(f"[AI] Gemini generated reply in {t1 - t0:.2f}s:")
+    print(f"[AI] LiveKit pipeline finished in {t1 - t0:.2f}s:")
     print(f"     [STT] Arthur:  \"{transcription}\"")
     print(f"     [NPC] {speaker}: \"{text}\"")
 
-    # 1. Send subtitle back to RDR2 over TCP
+    # Send subtitle back to RDR2 over TCP so RDR2 draws subtitles and turns off spinner
     try:
         payload = json.dumps({"transcription": transcription, "speaker": speaker, "text": text}) + "\n"
         client_sock.sendall(payload.encode("utf-8"))
     except Exception as e:
         print(f"[TCP ERROR] Failed to send response to RDR2: {e}")
-
-    # 2. Synthesize & play speech through Windows audio output
-    try:
-        tts.speak(text, is_male=is_male, blocking=False)
-    except Exception as e:
-        print(f"[TTS ERROR] {e}")
 
 def handle_client(conn, addr):
     global current_context, is_recording
@@ -87,7 +78,7 @@ def handle_client(conn, addr):
                     with lock:
                         if is_recording:
                             is_recording = False
-                            print("[MIC] Stopped recording. Querying Gemini...")
+                            print("[MIC] Stopped recording. Querying LiveKit Agent...")
                             audio_bytes = recorder.stop()
                             # Run inference in separate thread so TCP listener stays responsive
                             threading.Thread(
@@ -109,10 +100,11 @@ def handle_client(conn, addr):
         pass
 
 def main():
-    print("=" * 60)
+    print("=" * 65)
     print("  RDR2 VoiceNPC AI Bridge Server")
+    print("  LiveKit Agent Pipeline: Gemini (STT & LLM) + Cartesia (Sonic TTS)")
     print(f"  Listening on {HOST}:{PORT}")
-    print("=" * 60)
+    print("=" * 65)
 
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
