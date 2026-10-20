@@ -1,0 +1,6 @@
+google-genai
+sounddevice
+soundfile
+edge-tts
+python-dotenv
+numpy

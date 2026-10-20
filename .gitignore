@@ -1,0 +1,28 @@
+# Environment variables & secrets
+.env
+*.env
+*.env.local
+
+# Python virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# Python cache & compiled bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C++ Build & object files
+*.obj
+*.pdb
+*.ilk
+*.exp
+
+# IDE & OS files
+.vs/
+.vscode/
+*.user
+.DS_Store
+Thumbs.db
