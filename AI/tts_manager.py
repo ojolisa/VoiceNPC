@@ -94,9 +94,10 @@ class TTSManager:
         data, sr = sf.read(buf)
         return data, sr
 
-    def _speak_worker(self, text: str, is_male: bool, occupation: str, blocking: bool):
+    def _speak_worker(self, text: str, is_male: bool, occupation: str, voice_id: str = None, blocking: bool = False):
         clean_text = text.replace('"', '').replace("'", "'").strip()
-        voice_id = self.select_voice(is_male, occupation)
+        if not voice_id:
+            voice_id = self.select_voice(is_male, occupation)
 
         # 1. Primary: Cartesia
         if self.client:
@@ -125,17 +126,17 @@ class TTSManager:
         except Exception as e:
             print(f"[TTS FALLBACK ERROR] Failed to synthesize/play audio: {e}")
 
-    def speak(self, text: str, is_male: bool = True, occupation: str = "", blocking: bool = False):
+    def speak(self, text: str, is_male: bool = True, occupation: str = "", voice_id: str = None, blocking: bool = False):
         """Generates TTS audio using Cartesia and plays through PC audio output."""
         if not text or not text.strip():
             return
 
         if blocking:
-            self._speak_worker(text, is_male, occupation, blocking=True)
+            self._speak_worker(text, is_male, occupation, voice_id=voice_id, blocking=True)
         else:
             t = threading.Thread(
                 target=self._speak_worker,
-                args=(text, is_male, occupation, False),
+                args=(text, is_male, occupation, voice_id, False),
                 daemon=True
             )
             t.start()

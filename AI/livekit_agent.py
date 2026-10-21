@@ -12,6 +12,7 @@ from google.genai import types
 from zones import get_zone_name
 from ped_models import get_ped_occupation
 from tts_manager import TTSManager, CARTESIA_MALE_VOICES, CARTESIA_FEMALE_VOICES
+from ped_memory import PedMemoryManager
 
 load_dotenv()
 
@@ -20,12 +21,13 @@ class LiveKitVoiceNPCAgent:
     
     Orchestrates the full voice loop:
       - STT: Cartesia ink-whisper (ultra-fast ~0.15s transcription)
-      - LLM: Google Gemini (zero reasoning budget for sub-2s period dialogue)
-      - TTS: Cartesia Sonic-3 (ultra-low latency frontier character speech)
+      - LLM: Google Gemini with Redis dialogue memory keyed by pedId
+      - TTS: Cartesia Sonic-3 with consistent voice caching per pedId
     """
     def __init__(self):
         self.gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
-        self.cartesia_key = os.getenv("CARTESIA_API_KEY", "sk_car_ecV7TQdX6AnxEwyYbpLvhk").strip()
+        self.cartesia_key = os.getenv("CARTESIA_API_KEY", "").strip()
+        self.model_name = os.getenv("GEMINI_MODEL", "gemini-3.5-flash").strip()
         
         # Initialize Gemini LLM Client
         if not self.gemini_key:
@@ -48,7 +50,11 @@ class LiveKitVoiceNPCAgent:
 
         # Initialize Cartesia TTS Manager
         self.tts = TTSManager()
-        print(f"[LIVEKIT AGENT] Initialized LiveKit Voice Agent pipeline: Cartesia STT + Gemini LLM (0-reasoning) + Cartesia TTS.")
+
+        # Initialize Redis Ped Memory & Voice Cache
+        self.memory = PedMemoryManager()
+
+        print("[LIVEKIT AGENT] Initialized LiveKit Voice Agent pipeline: Cartesia STT + Gemini LLM (Redis Memory) + Cartesia TTS (Cached Voice).")
 
     def transcribe_audio(self, audio_bytes: bytes) -> str:
         """Transcribes Arthur Morgan's audio bytes using Cartesia STT (ink-whisper)."""
@@ -71,8 +77,8 @@ class LiveKitVoiceNPCAgent:
             print(f"[CARTESIA STT ERROR] Transcription failed: {e}")
             return ""
 
-    def build_system_instruction(self, context: dict) -> tuple:
-        """Constructs the period-accurate 1899 prompt from in-game telemetry."""
+    def build_system_instruction(self, context: dict, history_len: int = 0) -> tuple:
+        """Constructs the period-accurate 1899 prompt from in-game telemetry and history awareness."""
         zone_val = context.get("zone", 0)
         zone_name = zone_val if isinstance(zone_val, str) else get_zone_name(zone_val)
 
@@ -137,6 +143,12 @@ class LiveKitVoiceNPCAgent:
             elif is_snowing:
                 situation_notes.append("It is freezing and snowing heavily.")
 
+        if history_len > 0:
+            situation_notes.append(
+                f"CONVERSATION CONTINUITY: You have exchanged dialogue with Arthur Morgan {history_len} time(s) moments ago. "
+                "Maintain conversational continuity and remember what you previously discussed."
+            )
+
         situation_str = "\n- ".join(situation_notes)
         if situation_str:
             situation_str = "- " + situation_str
@@ -164,15 +176,36 @@ class LiveKitVoiceNPCAgent:
         return instruction, occupation, zone_name
 
     def process_turn(self, context: dict, audio_bytes: bytes = None, text_input: str = None) -> dict:
-        """Executes the LiveKit agent loop: Cartesia STT -> Gemini Reasoning (0-thinking) -> Cartesia TTS."""
+        """Executes the LiveKit agent loop: Cartesia STT -> Gemini Reasoning (with Redis Memory) -> Cartesia TTS (Cached Voice)."""
+        raw_ped_id = context.get("pedId")
+        if raw_ped_id is None:
+            raw_ped_id = context.get("ped_id") or context.get("id") or "default"
+        ped_id = str(raw_ped_id)
+
+        is_male = context.get("isMale", True)
+        model_hash = context.get("model", 0)
+        rel_group = context.get("relGroup", 0)
+        occupation = get_ped_occupation(model_hash, rel_group)
+
+        # 1. Fetch or cache consistent Cartesia Voice ID for this ped
+        voice_id = self.memory.get_or_set_voice_id(
+            ped_id=ped_id,
+            is_male=is_male,
+            occupation=occupation,
+            voice_selector_fn=self.tts.select_voice
+        )
+        print(f"[PED MEMORY] Ped #{ped_id} bound to voice_id: {voice_id}")
+
         if not self.gemini_client:
             return {
                 "transcription": "(API key missing)",
                 "speaker": "Stranger",
-                "text": "Don't just stare at me, mister! (Set GEMINI_API_KEY in AI/.env)"
+                "text": "Don't just stare at me, mister! (Set GEMINI_API_KEY in AI/.env)",
+                "ped_id": ped_id,
+                "voice_id": voice_id
             }
 
-        # 1. Step 1: Speech-to-Text via Cartesia STT (~0.15s)
+        # 2. Step 1: Speech-to-Text via Cartesia STT (~0.15s)
         transcription = ""
         if text_input and text_input.strip():
             transcription = text_input.strip()
@@ -182,27 +215,48 @@ class LiveKitVoiceNPCAgent:
         if not transcription:
             transcription = "(Silence)" if (not audio_bytes or len(audio_bytes) <= 2000) else "(Silence / Inaudible)"
 
-        # 2. Step 2: LLM Dialogue Reasoning via Google Gemini (zero reasoning budget)
-        instruction, occupation, zone_name = self.build_system_instruction(context)
-        is_male = context.get("isMale", True)
+        # 3. Retrieve dialogue memory for this ped from Redis
+        history = self.memory.get_history(ped_id, max_turns=6)
+        instruction, occupation, zone_name = self.build_system_instruction(context, history_len=len(history))
+
         is_player_aiming = context.get("isPlayerAiming", False)
         is_hogtied = context.get("isHogtied", False)
         mode = context.get("mode", "greet")
 
-        contents = []
         if transcription and transcription not in ["(Silence)", "(Silence / Inaudible)"]:
-            contents.append(f"Arthur Morgan says to you: \"{transcription}\". Respond in character in authentic 1899 dialect.")
+            current_user_prompt = f"Arthur Morgan says to you: \"{transcription}\". Respond in character in authentic 1899 dialect."
         else:
             if is_player_aiming:
-                contents.append("Arthur Morgan is aiming his weapon directly at you without speaking. React to this immediate life threat!")
+                current_user_prompt = "Arthur Morgan is aiming his weapon directly at you without speaking. React to this immediate life threat!"
             elif is_hogtied:
-                contents.append("Arthur Morgan stands over you while you are hogtied on the ground. React to being tied up!")
+                current_user_prompt = "Arthur Morgan stands over you while you are hogtied on the ground. React to being tied up!"
             elif mode == "antagonize":
-                contents.append("Arthur Morgan glared at you and aggressively antagonized you without speaking. React naturally.")
+                current_user_prompt = "Arthur Morgan glared at you and aggressively antagonized you without speaking. React naturally."
             else:
-                contents.append("Arthur Morgan approaches you silently. React naturally to his presence.")
+                current_user_prompt = "Arthur Morgan approaches you silently. React naturally to his presence."
 
-        last_error = None
+        # Assemble multi-turn contents including Redis conversation history
+        contents = []
+        for past_turn in history:
+            u_text = past_turn.get("user")
+            a_text = past_turn.get("assistant")
+            a_spk = past_turn.get("speaker") or occupation or "NPC"
+            if u_text and a_text:
+                contents.append(types.Content(
+                    role="user",
+                    parts=[types.Part.from_text(text=u_text)]
+                ))
+                contents.append(types.Content(
+                    role="model",
+                    parts=[types.Part.from_text(text=json.dumps({"speaker": a_spk, "text": a_text}))]
+                ))
+
+        contents.append(types.Content(
+            role="user",
+            parts=[types.Part.from_text(text=current_user_prompt)]
+        ))
+
+        # 4. Step 2: LLM Dialogue Reasoning via Google Gemini (zero reasoning budget, with retry)
         try:
             config = types.GenerateContentConfig(
                 system_instruction=instruction,
@@ -213,11 +267,24 @@ class LiveKitVoiceNPCAgent:
                 top_p=0.9
             )
 
-            response = self.gemini_client.models.generate_content(
-                model="gemini-3.5-flash",
-                contents=contents,
-                config=config
-            )
+            response = None
+            last_err = None
+            for attempt in range(2):
+                try:
+                    response = self.gemini_client.models.generate_content(
+                        model=self.model_name,
+                        contents=contents,
+                        config=config
+                    )
+                    break
+                except Exception as ex:
+                    last_err = ex
+                    if attempt == 0:
+                        time.sleep(0.5)
+
+            if response is None:
+                raise last_err or RuntimeError("No response from Gemini API")
+
             text_resp = response.text.strip()
             data = json.loads(text_resp)
             if isinstance(data, list) and len(data) > 0:
@@ -229,23 +296,42 @@ class LiveKitVoiceNPCAgent:
 
             text = data.get("text") or data.get("reply", "...")
 
-            # 3. Step 3: Text-to-Speech via Cartesia Sonic TTS
-            self.tts.speak(text, is_male=is_male, occupation=speaker, blocking=False)
+            # 5. Persist interaction into Redis Ped Memory
+            self.memory.add_turn(
+                ped_id=ped_id,
+                user_text=current_user_prompt,
+                npc_speaker=speaker,
+                npc_text=text
+            )
+
+            # 6. Step 3: Text-to-Speech via Cartesia Sonic TTS with consistent cached voice
+            self.tts.speak(text, is_male=is_male, occupation=speaker, voice_id=voice_id, blocking=False)
 
             return {
                 "transcription": transcription,
                 "speaker": speaker,
-                "text": text
+                "text": text,
+                "ped_id": ped_id,
+                "voice_id": voice_id
             }
 
         except Exception as e:
             print(f"[LIVEKIT AGENT] Gemini model failed: {e}")
             fallback_text = "Howdy, mister! I ain't got much to say right now."
-            self.tts.speak(fallback_text, is_male=is_male, occupation=occupation or "Stranger", blocking=False)
+            # Record fallback turn in Redis memory so dialogue continuity remains intact
+            self.memory.add_turn(
+                ped_id=ped_id,
+                user_text=current_user_prompt,
+                npc_speaker=occupation or "Stranger",
+                npc_text=fallback_text
+            )
+            self.tts.speak(fallback_text, is_male=is_male, occupation=occupation or "Stranger", voice_id=voice_id, blocking=False)
             return {
                 "transcription": transcription or "(Speech processing error)",
                 "speaker": occupation or "Stranger",
-                "text": fallback_text
+                "text": fallback_text,
+                "ped_id": ped_id,
+                "voice_id": voice_id
             }
 
 # --- Standalone LiveKit Agents CLI Runner ---
@@ -261,12 +347,13 @@ try:
 
     @server.rtc_session()
     async def entrypoint(ctx: JobContext):
-        cartesia_key = os.getenv("CARTESIA_API_KEY", "sk_car_ecV7TQdX6AnxEwyYbpLvhk")
+        cartesia_key = os.getenv("CARTESIA_API_KEY", "")
         gemini_key = os.getenv("GEMINI_API_KEY")
+        gemini_model = os.getenv("GEMINI_MODEL", "gemini-3.5-flash")
 
         stt = livekit_cartesia.STT(api_key=cartesia_key, model="ink-whisper")
         tts = livekit_cartesia.TTS(api_key=cartesia_key, model="sonic-3", voice="726d5ae5-055f-4c3d-8355-d9677de68937")
-        llm = livekit_google.LLM(model="gemini-3.5-flash", api_key=gemini_key)
+        llm = livekit_google.LLM(model=gemini_model, api_key=gemini_key)
 
         session = AgentSession(
             stt=stt,

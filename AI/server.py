@@ -18,7 +18,8 @@ lock = threading.Lock()
 def process_interaction(client_sock, context: dict, audio_bytes: bytes):
     """Processes Arthur's voice with LiveKit Voice Agent (Gemini + Cartesia) and sends subtitles to RDR2."""
     mode = context.get("mode", "greet")
-    print(f"\n[AI] Processing conversation via LiveKit Agent... (Mode: {mode}, Audio size: {len(audio_bytes)} bytes)")
+    ped_id = context.get("pedId", "Unknown")
+    print(f"\n[AI] Processing conversation via LiveKit Agent... (Target Ped: {ped_id}, Mode: {mode}, Audio size: {len(audio_bytes)} bytes)")
 
     t0 = time.time()
     result = agent.process_turn(context, audio_bytes=audio_bytes)
@@ -27,7 +28,10 @@ def process_interaction(client_sock, context: dict, audio_bytes: bytes):
     transcription = result.get("transcription", "")
     speaker = result.get("speaker", "Stranger")
     text = result.get("text", "...")
+    voice_id = result.get("voice_id", "N/A")
+
     print(f"[AI] LiveKit pipeline finished in {t1 - t0:.2f}s:")
+    print(f"     [PED] ID: {ped_id} | Voice ID: {voice_id}")
     print(f"     [STT] Arthur:  \"{transcription}\"")
     print(f"     [NPC] {speaker}: \"{text}\"")
 
@@ -103,6 +107,7 @@ def main():
     print("=" * 65)
     print("  RDR2 VoiceNPC AI Bridge Server")
     print("  LiveKit Agent Pipeline: Gemini (STT & LLM) + Cartesia (Sonic TTS)")
+    print("  Redis Memory: Conversation Turns & Voice ID Caching per Ped")
     print(f"  Listening on {HOST}:{PORT}")
     print("=" * 65)
 
