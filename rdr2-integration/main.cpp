@@ -246,43 +246,6 @@ inline void DisableAction(Hash control)
     PAD::DISABLE_CONTROL_ACTION(0, control, true);
 }
 
-// Fallback: Find closest living human NPC in front of Arthur when pressing Push-To-Talk ('T')
-Ped FindClosestFacingPed(Ped playerPed, float maxDistance = 4.0f)
-{
-    const int MAX_PEDS = 64;
-    int peds[MAX_PEDS];
-    int count = worldGetAllPeds(peds, MAX_PEDS);
-
-    Vector3 pCoords = ENTITY::GET_ENTITY_COORDS(playerPed, true, false);
-    Vector3 forward = ENTITY::GET_ENTITY_FORWARD_VECTOR(playerPed);
-
-    Ped bestPed = 0;
-    float bestDist = maxDistance;
-
-    for (int i = 0; i < count; ++i)
-    {
-        Ped p = (Ped)peds[i];
-        if (p == playerPed || !ENTITY::DOES_ENTITY_EXIST(p) || ENTITY::IS_ENTITY_DEAD(p) || PED::IS_PED_A_PLAYER(p))
-            continue;
-        if (!PED::IS_PED_HUMAN(p))
-            continue;
-
-        Vector3 pedCoords = ENTITY::GET_ENTITY_COORDS(p, true, false);
-        float dist = MISC::GET_DISTANCE_BETWEEN_COORDS(pCoords.x, pCoords.y, pCoords.z, pedCoords.x, pedCoords.y, pedCoords.z, true);
-        if (dist < bestDist)
-        {
-            Vector3 toPed = { pedCoords.x - pCoords.x, pedCoords.y - pCoords.y, pedCoords.z - pCoords.z };
-            float dot = (toPed.x * forward.x + toPed.y * forward.y);
-            if (dot > 0.0f)
-            {
-                bestDist = dist;
-                bestPed = p;
-            }
-        }
-    }
-    return bestPed;
-}
-
 // Check physical controller A button across all 4 XInput controller slots
 bool IsControllerAPressed()
 {
@@ -321,7 +284,7 @@ void UpdateVoicePrompt(Ped targetPed)
         DeleteVoicePrompt();
         g_lastPromptPed = targetPed;
 
-        if (targetPed != 0 && ENTITY::DOES_ENTITY_EXIST(targetPed) && !ENTITY::IS_ENTITY_DEAD(targetPed))
+        if (targetPed != 0 && ENTITY::DOES_ENTITY_EXIST(targetPed) && !ENTITY::IS_ENTITY_DEAD(targetPed) && PED::IS_PED_HUMAN(targetPed))
         {
             int groupId = HUD::_UIPROMPT_GET_GROUP_ID_FOR_TARGET_ENTITY((Entity)targetPed);
             if (groupId != 0)
@@ -343,20 +306,23 @@ void UpdateVoicePrompt(Ped targetPed)
     else if (targetPed != 0 && g_voicePrompt == 0)
     {
         // If groupId wasn't ready on the first tick, attach as soon as it becomes valid
-        int groupId = HUD::_UIPROMPT_GET_GROUP_ID_FOR_TARGET_ENTITY((Entity)targetPed);
-        if (groupId != 0)
+        if (ENTITY::DOES_ENTITY_EXIST(targetPed) && !ENTITY::IS_ENTITY_DEAD(targetPed) && PED::IS_PED_HUMAN(targetPed))
         {
-            g_voicePrompt = HUD::_UIPROMPT_REGISTER_BEGIN();
-            HUD::_UIPROMPT_SET_CONTROL_ACTION(g_voicePrompt, 0xD10A3A36); // INPUT_INTERACT_LOCKON_A
-            const char* str = MISC::_CREATE_VAR_STRING(10, "LITERAL_STRING", "Speak");
-            HUD::_UIPROMPT_SET_TEXT(g_voicePrompt, str);
-            HUD::_UIPROMPT_SET_HOLD_INDEFINITELY_MODE(g_voicePrompt);
-            HUD::_UIPROMPT_SET_PRIORITY(g_voicePrompt, 2);
-            HUD::_UIPROMPT_SET_GROUP(g_voicePrompt, groupId, 0);
-            HUD::_UIPROMPT_REGISTER_END(g_voicePrompt);
+            int groupId = HUD::_UIPROMPT_GET_GROUP_ID_FOR_TARGET_ENTITY((Entity)targetPed);
+            if (groupId != 0)
+            {
+                g_voicePrompt = HUD::_UIPROMPT_REGISTER_BEGIN();
+                HUD::_UIPROMPT_SET_CONTROL_ACTION(g_voicePrompt, 0xD10A3A36); // INPUT_INTERACT_LOCKON_A
+                const char* str = MISC::_CREATE_VAR_STRING(10, "LITERAL_STRING", "Speak");
+                HUD::_UIPROMPT_SET_TEXT(g_voicePrompt, str);
+                HUD::_UIPROMPT_SET_HOLD_INDEFINITELY_MODE(g_voicePrompt);
+                HUD::_UIPROMPT_SET_PRIORITY(g_voicePrompt, 2);
+                HUD::_UIPROMPT_SET_GROUP(g_voicePrompt, groupId, 0);
+                HUD::_UIPROMPT_REGISTER_END(g_voicePrompt);
 
-            HUD::_UIPROMPT_SET_VISIBLE(g_voicePrompt, true);
-            HUD::_UIPROMPT_SET_ENABLED(g_voicePrompt, true);
+                HUD::_UIPROMPT_SET_VISIBLE(g_voicePrompt, true);
+                HUD::_UIPROMPT_SET_ENABLED(g_voicePrompt, true);
+            }
         }
     }
 }
@@ -395,10 +361,13 @@ void update()
         PLAYER::GET_ENTITY_PLAYER_IS_FREE_AIMING_AT(player, &targetEntity);
     }
 
-    // Only update target ped if a valid living ped exists; clear if not targeting
+    // Only update target ped if a valid living human NPC exists; clear if not targeting
     if (ENTITY::DOES_ENTITY_EXIST(targetEntity) && 
         ENTITY::IS_ENTITY_A_PED(targetEntity) && 
-        !ENTITY::IS_ENTITY_DEAD(targetEntity))
+        !ENTITY::IS_ENTITY_DEAD(targetEntity) &&
+        (Ped)targetEntity != playerPed &&
+        !PED::IS_PED_A_PLAYER((Ped)targetEntity) &&
+        PED::IS_PED_HUMAN((Ped)targetEntity))
     {
         currentTargetPed = (Ped)targetEntity;
     }
@@ -422,16 +391,10 @@ void update()
         }
     }
 
-    // Fallback for Keyboard 'T': if Arthur is facing an NPC nearby, pick them up
-    if (currentTargetPed == 0 && isTKey && !bWasInteracting)
-    {
-        currentTargetPed = FindClosestFacingPed(playerPed, 4.0f);
-    }
-
     // Update native bottom-right prompt UI attached to the targeted ped
     UpdateVoicePrompt(currentTargetPed);
 
-    // Voice interaction only triggers on A (Controller) or T (Keyboard)
+    // Voice interaction only triggers on A (Controller) or T (Keyboard) while locked on
     // Vanilla Greet (X / R), Antagonize (B / F), and Rob (Y / E) are 100% untouched!
     bool isInteracting = (isControllerA || isTKey) && (currentTargetPed != 0);
 
