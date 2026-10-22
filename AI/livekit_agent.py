@@ -3,6 +3,8 @@ import io
 import json
 import time
 import random
+import wave
+import soundfile as sf
 from dotenv import load_dotenv
 
 from cartesia import Cartesia
@@ -11,7 +13,7 @@ from google.genai import types
 
 from zones import get_zone_name
 from ped_models import get_ped_occupation
-from tts_manager import TTSManager, CARTESIA_MALE_VOICES, CARTESIA_FEMALE_VOICES
+from tts_manager import TTSManager, CARTESIA_MALE_VOICES, CARTESIA_FEMALE_VOICES, NAMED_CHARACTER_VOICES
 from ped_memory import PedMemoryManager
 
 load_dotenv()
@@ -20,7 +22,7 @@ class LiveKitVoiceNPCAgent:
     """LiveKit-powered conversational voice agent for Red Dead Redemption 2.
     
     Orchestrates the full voice loop:
-      - STT: Cartesia ink-whisper (ultra-fast ~0.15s transcription)
+      - STT: Cartesia ink-2 (flagship streaming transcription with semantic turn detection)
       - LLM: Google Gemini with Redis dialogue memory keyed by pedId
       - TTS: Cartesia Sonic-3 with consistent voice caching per pedId
     """
@@ -28,6 +30,7 @@ class LiveKitVoiceNPCAgent:
         self.gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
         self.cartesia_key = os.getenv("CARTESIA_API_KEY", "").strip()
         self.model_name = os.getenv("GEMINI_MODEL", "gemini-3.5-flash").strip()
+        self.stt_model = os.getenv("CARTESIA_STT_MODEL", "ink-2").strip()
         
         # Initialize Gemini LLM Client
         if not self.gemini_key:
@@ -43,7 +46,7 @@ class LiveKitVoiceNPCAgent:
         else:
             try:
                 self.cartesia_client = Cartesia(api_key=self.cartesia_key)
-                print("[LIVEKIT AGENT] Initialized Cartesia STT (ink-whisper).")
+                print(f"[LIVEKIT AGENT] Initialized Cartesia STT ({self.stt_model}).")
             except Exception as e:
                 print(f"[LIVEKIT AGENT WARNING] Failed to initialize Cartesia STT: {e}")
                 self.cartesia_client = None
@@ -54,28 +57,67 @@ class LiveKitVoiceNPCAgent:
         # Initialize Redis Ped Memory & Voice Cache
         self.memory = PedMemoryManager()
 
-        print("[LIVEKIT AGENT] Initialized LiveKit Voice Agent pipeline: Cartesia STT + Gemini LLM (Redis Memory) + Cartesia TTS (Cached Voice).")
+        print("[LIVEKIT AGENT] Initialized LiveKit Voice Agent pipeline: Cartesia STT (ink-2) + Gemini LLM (Redis Memory) + Cartesia TTS (Cached Voice).")
 
     def transcribe_audio(self, audio_bytes: bytes) -> str:
-        """Transcribes Arthur Morgan's audio bytes using Cartesia STT (ink-whisper)."""
+        """Transcribes Arthur Morgan's audio bytes using Cartesia STT (ink-2 with fallback)."""
         if not self.cartesia_client or not audio_bytes or len(audio_bytes) < 2000:
             return ""
 
-        try:
-            t0 = time.time()
-            stt_resp = self.cartesia_client.stt.transcribe(
-                file=("speech.wav", io.BytesIO(audio_bytes), "audio/wav"),
-                model="ink-whisper",
-                language="en"
-            )
-            t1 = time.time()
-            transcript = getattr(stt_resp, "text", "") or ""
-            transcript = transcript.strip()
-            print(f"[CARTESIA STT] Transcribed in {t1 - t0:.2f}s: \"{transcript}\"")
-            return transcript
-        except Exception as e:
-            print(f"[CARTESIA STT ERROR] Transcription failed: {e}")
-            return ""
+        t0 = time.time()
+        transcript = ""
+
+        # Primary STT Path: Cartesia ink-2 via streaming manual finalize websocket
+        if self.stt_model == "ink-2":
+            try:
+                sample_rate = 16000
+                pcm_bytes = b""
+                try:
+                    with wave.open(io.BytesIO(audio_bytes), "rb") as wf:
+                        sample_rate = wf.getframerate()
+                        pcm_bytes = wf.readframes(wf.getnframes())
+                except Exception:
+                    data, sample_rate = sf.read(io.BytesIO(audio_bytes), dtype="int16")
+                    pcm_bytes = data.tobytes()
+
+                if pcm_bytes:
+                    transcript_parts = []
+                    with self.cartesia_client.stt.manual_finalize.websocket(
+                        model="ink-2",
+                        encoding="pcm_s16le",
+                        sample_rate=sample_rate,
+                    ) as ws:
+                        # Stream chunks to WebSocket (100ms chunks)
+                        chunk_size = max(1024, int(sample_rate * 2 * 0.1))
+                        for i in range(0, len(pcm_bytes), chunk_size):
+                            ws.send_raw(pcm_bytes[i:i + chunk_size])
+                        ws.send("finalize")
+                        ws.send("close")
+                        for event in ws:
+                            if hasattr(event, "text") and event.text:
+                                transcript_parts.append(event.text)
+                    transcript = "".join(transcript_parts).strip()
+            except Exception as e:
+                print(f"[CARTESIA INK-2 WARNING] WebSocket transcription failed ({e}), falling back to ink-whisper REST...")
+                transcript = ""
+
+        # Fallback / Secondary STT Path: Cartesia ink-whisper REST
+        if not transcript:
+            try:
+                stt_resp = self.cartesia_client.stt.transcribe(
+                    file=("speech.wav", io.BytesIO(audio_bytes), "audio/wav"),
+                    model="ink-whisper",
+                    language="en"
+                )
+                transcript = getattr(stt_resp, "text", "") or ""
+                transcript = transcript.strip()
+            except Exception as e:
+                print(f"[CARTESIA STT ERROR] Transcription failed: {e}")
+                return ""
+
+        t1 = time.time()
+        print(f"[CARTESIA STT] Transcribed via {self.stt_model} in {t1 - t0:.2f}s: \"{transcript}\"")
+        return transcript
 
     def build_system_instruction(self, context: dict, history_len: int = 0) -> tuple:
         """Constructs the period-accurate 1899 prompt from in-game telemetry and history awareness."""

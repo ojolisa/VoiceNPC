@@ -8,8 +8,16 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Cloned & Dedicated Story Character Voices
+NAMED_CHARACTER_VOICES = {
+    "dutch": "895b84f0-e43b-441b-8b91-b4e5942be367",
+    "dutch van der linde": "895b84f0-e43b-441b-8b91-b4e5942be367",
+    "cs_dutch": "895b84f0-e43b-441b-8b91-b4e5942be367",
+}
+
 # High-fidelity Western frontier Cartesia voices
 CARTESIA_MALE_VOICES = [
+    {"name": "Dutch van der Linde (Cloned)", "id": "895b84f0-e43b-441b-8b91-b4e5942be367", "style": "leader"},
     {"name": "Troy", "id": "726d5ae5-055f-4c3d-8355-d9677de68937", "style": "cowboy"},
     {"name": "Trevor", "id": "c45bc5ec-dc68-4feb-8829-6e6b2748095d", "style": "elder"},
     {"name": "James", "id": "42b39f37-515f-4eee-8546-73e841679c1d", "style": "lawman"},
@@ -47,8 +55,14 @@ class TTSManager:
             print("[TTS WARNING] CARTESIA_API_KEY not found in environment!")
 
     def select_voice(self, is_male: bool = True, occupation: str = "") -> str:
-        """Selects an authentic Cartesia voice ID based on NPC gender and role."""
+        """Selects an authentic Cartesia voice ID based on NPC gender, role, or specific character."""
         occ_lower = (occupation or "").lower()
+
+        # Check for dedicated / cloned story character voices (e.g. Dutch)
+        for char_name, voice_id in NAMED_CHARACTER_VOICES.items():
+            if char_name in occ_lower:
+                return voice_id
+
         if is_male:
             if any(k in occ_lower for k in ["sheriff", "marshal", "deputy", "police", "guard", "officer"]):
                 return "42b39f37-515f-4eee-8546-73e841679c1d"  # James (Authoritative)
